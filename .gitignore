@@ -1,0 +1,12 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+*.suo
+
+# Do not commit game packages, converted assets, or build artifacts.
+*.crp
+*.glb
+*.dll
+*.pdb
