@@ -9,7 +9,9 @@
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
     <PackageReference Include="Pfim" Version="0.11.4" />
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <InternalsVisibleTo Include="OfflineCrpConverter.Tests" />
   </ItemGroup>
 </Project>

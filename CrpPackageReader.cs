@@ -59,6 +59,8 @@ internal sealed record CrpTransform(Vector3 Position, Quaternion Rotation, Vecto
 
 internal sealed record CrpChild(string ObjectChecksum, Vector3 Position, float AngleDegrees);
 
+internal sealed record CrpWorkshopPlacement(string PrefabName, Vector3 Position, float AngleDegrees);
+
 internal sealed record CrpGameObject(
     string Name,
     string AssetChecksum,
@@ -68,7 +70,10 @@ internal sealed record CrpGameObject(
     IReadOnlyList<CrpChild> Children,
     string? PrefabComponent,
     IReadOnlyList<string> NetworkVariantNames,
-    bool ApplyTransform);
+    bool ApplyTransform)
+{
+    public IReadOnlyList<CrpWorkshopPlacement> WorkshopPlacements { get; init; } = [];
+}
 
 internal sealed class CrpPackage
 {
@@ -80,6 +85,8 @@ internal sealed class CrpPackage
     public required IReadOnlyDictionary<string, CrpTexture> Textures { get; init; }
     public required IReadOnlyDictionary<string, CrpMaterial> Materials { get; init; }
     public required IReadOnlyDictionary<string, CrpGameObject> GameObjects { get; init; }
+    public IReadOnlyList<string> DependencySourcePaths { get; init; } = [];
+    public IReadOnlySet<string> GroundDecalMaterialChecksums { get; init; } = new HashSet<string>();
 
     public int ReachableMeshCount => GetReachableRenderMeshes().Count;
     public int ReachablePrimitiveCount => GetReachableRenderMeshes()
@@ -147,7 +154,7 @@ internal static class CrpPackageReader
         }
 
         var formatVersion = reader.ReadUInt16();
-        if (formatVersion is < 4 or > 10)
+        if (formatVersion is < 3 or > 10)
         {
             throw new InvalidDataException($"尚未验证的 CRP 格式版本：{formatVersion}");
         }
@@ -211,7 +218,7 @@ internal static class CrpPackageReader
                     break;
                 case "UnityEngine.Texture2D":
                 case "ColossalFramework.Importers.Image":
-                    AddUnique(textures, header.Checksum, ReadTexture(reader), "贴图");
+                    AddUnique(textures, header.Checksum, ReadTexture(reader, formatVersion), "贴图");
                     break;
                 case "UnityEngine.Material":
                     AddUnique(materials, header.Checksum, ReadMaterial(reader), "材质");
@@ -247,8 +254,37 @@ internal static class CrpPackageReader
             }
         }
 
+        foreach (var gameObject in gameObjects.Values.ToArray())
+        {
+            var children = gameObject.Children.Select(child =>
+            {
+                if (gameObjects.ContainsKey(child.ObjectChecksum))
+                {
+                    return child;
+                }
+
+                var referencedObjects = headers
+                    .Where(header => string.Equals(header.Name, child.ObjectChecksum, StringComparison.Ordinal) &&
+                        gameObjects.ContainsKey(header.Checksum))
+                    .ToArray();
+                if (referencedObjects.Length != 1)
+                {
+                    throw new InvalidDataException(
+                        $"建筑 {gameObject.Name} 的附属对象引用 {child.ObjectChecksum} 匹配到 {referencedObjects.Length} 个对象");
+                }
+
+                return child with { ObjectChecksum = referencedObjects[0].Checksum };
+            }).ToArray();
+            gameObjects[gameObject.AssetChecksum] = gameObject with { Children = children };
+        }
+
+        var childChecksums = gameObjects.Values
+            .SelectMany(static item => item.Children)
+            .Select(static child => child.ObjectChecksum)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var mainObjects = gameObjects.Values
-            .Where(static item => item.PrefabComponent is "BuildingInfo" or "PropInfo" or "VehicleInfo" or "NetInfo")
+            .Where(static item => item.PrefabComponent is "BuildingInfo" or "PropInfo" or "TreeInfo" or "VehicleInfo" or "NetInfo")
+            .Where(item => !childChecksums.Contains(item.AssetChecksum))
             .ToArray();
         var namedMainObjects = mainObjects
             .Where(static item => item.Name.EndsWith("_Data", StringComparison.Ordinal))
@@ -503,14 +539,15 @@ internal static class CrpPackageReader
         return new CrpMesh(positions, colors, textureCoordinates, normals, tangents, triangles);
     }
 
-    private static CrpTexture ReadTexture(BinaryReader reader)
+    private static CrpTexture ReadTexture(BinaryReader reader, ushort formatVersion)
     {
         var forceLinear = reader.ReadBoolean();
-        var imageLength = reader.ReadUInt32();
-        if (imageLength <= 8)
+        if (formatVersion >= 6)
         {
-            imageLength = reader.ReadUInt32();
+            _ = reader.ReadInt32(); // anisoLevel, not image length
         }
+
+        var imageLength = reader.ReadUInt32();
 
         if (imageLength < 8 || imageLength > int.MaxValue)
         {
@@ -586,6 +623,7 @@ internal static class CrpPackageReader
         string? meshChecksum = null;
         IReadOnlyList<string> materialChecksums = [];
         var children = new List<CrpChild>();
+        var workshopPlacements = new List<CrpWorkshopPlacement>();
         var networkVariantNames = new List<string>();
         string? prefabComponent = null;
 
@@ -614,14 +652,25 @@ internal static class CrpPackageReader
                 case "BuildingInfo":
                 case "BuildingInfoSub":
                     prefabComponent = runtimeType;
-                    var info = ReadPropertyBag(reader, formatVersion);
+                    var info = ReadPropertyBag(reader, formatVersion, prefabAssetEnd: assetEnd);
                     children.AddRange(ReadChildren(info, "m_subMeshes", "m_subInfo", includeFixedHeight: false));
                     children.AddRange(ReadChildren(info, "m_subBuildings", "m_buildingInfo", includeFixedHeight: true));
+                    workshopPlacements.AddRange(ReadWorkshopPlacements(info));
+                    if (reader.BaseStream.Position == assetEnd)
+                    {
+                        index = propertyCount;
+                    }
                     break;
                 case "PropInfo":
                 case "VehicleInfo":
                     prefabComponent = runtimeType;
                     _ = ReadPropertyBag(reader, formatVersion);
+                    break;
+                case "TreeInfo":
+                    prefabComponent = runtimeType;
+                    // Tree geometry is serialized by MeshFilter/MeshRenderer above. TreeInfo only
+                    // adds runtime variation, wind and UI fields; its atlas is not GLB geometry.
+                    index = propertyCount;
                     break;
                 case "NetInfo":
                     prefabComponent = runtimeType;
@@ -681,7 +730,46 @@ internal static class CrpPackageReader
             children,
             prefabComponent,
             networkVariantNames,
-            false);
+            false) { WorkshopPlacements = workshopPlacements };
+    }
+
+    private static IEnumerable<CrpWorkshopPlacement> ReadWorkshopPlacements(
+        IReadOnlyDictionary<string, object?> properties)
+    {
+        if (!properties.TryGetValue("m_props", out var value) || value is not object?[] entries)
+        {
+            yield break;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry is not IReadOnlyDictionary<string, object?> fields)
+            {
+                throw new InvalidDataException("建筑 m_props 条目结构不完整");
+            }
+
+            foreach (var propertyName in new[] { "m_prop", "m_tree" })
+            {
+                if (!fields.TryGetValue(propertyName, out var reference) || reference is not string name)
+                {
+                    continue;
+                }
+
+                var separator = name.IndexOf('.');
+                if (separator <= 0 || !ulong.TryParse(name.AsSpan(0, separator), out _))
+                {
+                    continue; // Unqualified built-in game decoration is not a workshop CRP dependency.
+                }
+
+                if (fields["m_position"] is not Vector3 position || fields["m_angle"] is not float angle ||
+                    fields["m_probability"] is not int probability || probability != 100)
+                {
+                    throw new InvalidDataException($"工坊道具 {name} 的放置结构不完整，或概率不是确定的 100%");
+                }
+
+                yield return new CrpWorkshopPlacement(name, position, angle);
+            }
+        }
     }
 
     private static IEnumerable<CrpChild> CreateNetworkRenderObjects(
@@ -759,7 +847,8 @@ internal static class CrpPackageReader
     private static Dictionary<string, object?> ReadPropertyBag(
         BinaryReader reader,
         ushort formatVersion,
-        string? lastPropertyName = null)
+        string? lastPropertyName = null,
+        long? prefabAssetEnd = null)
     {
         var propertyCount = reader.ReadInt32();
         if (propertyCount < 0 || propertyCount > 16384)
@@ -777,6 +866,19 @@ internal static class CrpPackageReader
 
             var runtimeType = reader.ReadString().Split(',')[0];
             var propertyName = reader.ReadString();
+            if (prefabAssetEnd is long end && propertyName == "m_Atlas" &&
+                runtimeType == "ColossalFramework.UI.UITextureAtlas")
+            {
+                if (!values.ContainsKey("m_props") || !values.ContainsKey("m_subMeshes") ||
+                    !values.ContainsKey("m_subBuildings"))
+                {
+                    throw new InvalidDataException("建筑 UI 尾部之前缺少必要的几何引用字段");
+                }
+
+                // PrefabInfo's inherited atlas/thumbnail fields are UI, after BuildingInfo geometry.
+                reader.BaseStream.Position = end;
+                return values;
+            }
             try
             {
                 values.Add(propertyName, ReadValue(reader, runtimeType, formatVersion));
@@ -854,6 +956,7 @@ internal static class CrpPackageReader
             "NetInfo+Segment" => ReadNetSegment(reader, formatVersion),
             "NetInfo+Node" => ReadNetNode(reader, formatVersion),
             "PropInfo+Variation" => ReadPropVariation(reader),
+            "TreeInfo+Variation" => ReadTreeVariation(reader),
             "PropInfo+ParkingSpace" => ReadPropParking(reader),
             "PropInfo+Effect" => ReadPropEffect(reader),
             "DepotAI+SpawnPoint" => ReadDepotSpawnPoint(reader),
@@ -865,7 +968,7 @@ internal static class CrpPackageReader
             "VehicleInfo+Effect" => ReadVehicleEffect(reader),
             "VehicleInfo+VehicleDoor" => ReadVehicleDoor(reader),
             "VehicleInfo+VehicleTrailer" => ReadVehicleTrailer(reader),
-            "BuildingInfo" or "BuildingInfoSub" or "VehicleInfo" or "PropInfo" =>
+            "BuildingInfo" or "BuildingInfoSub" or "VehicleInfo" or "PropInfo" or "TreeInfo" =>
                 ReadPropertyBag(reader, formatVersion),
             _ when IsSerializedInt(runtimeType) => reader.ReadInt32(),
             _ when runtimeType.EndsWith("AI", StringComparison.Ordinal) => ReadPropertyBag(reader, formatVersion),
@@ -1083,6 +1186,9 @@ internal static class CrpPackageReader
 
     private static Dictionary<string, object?> ReadPropVariation(BinaryReader reader)
         => new() { ["m_prop"] = reader.ReadString(), ["m_probability"] = reader.ReadInt32() };
+
+    private static Dictionary<string, object?> ReadTreeVariation(BinaryReader reader)
+        => new() { ["m_tree"] = reader.ReadString(), ["m_probability"] = reader.ReadInt32() };
 
     private static Dictionary<string, object?> ReadPropParking(BinaryReader reader)
         => new()

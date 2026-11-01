@@ -9,12 +9,22 @@ using SixLabors.ImageSharp.PixelFormats;
 
 namespace OfflineCrpConverter;
 
+internal enum CutoutTextureChannel
+{
+    Red,
+    Alpha,
+}
+
+internal sealed record TreeColorCorrection(float ExposureStops, float Saturation);
+
 internal static class GltfBuilder
 {
-    public static byte[] Build(CrpPackage package, string assetName)
-        => new Builder(package).Build(assetName);
+    public static byte[] Build(CrpPackage package, string assetName, TreeColorCorrection? treeColorCorrection = null,
+        bool preserveTreeColors = false, Action<string>? reportTreeColor = null)
+        => new Builder(package, treeColorCorrection, preserveTreeColors, reportTreeColor).Build(assetName);
 
-    private sealed class Builder(CrpPackage package)
+    private sealed class Builder(CrpPackage package, TreeColorCorrection? treeColorCorrection,
+        bool preserveTreeColors, Action<string>? reportTreeColor)
     {
         private readonly BinaryBuffer _binary = new();
         private readonly List<Dictionary<string, object?>> _bufferViews = [];
@@ -214,6 +224,12 @@ internal static class GltfBuilder
             }
 
             var source = package.Materials[checksum];
+            var isGroundDecal = package.GroundDecalMaterialChecksums.Contains(checksum);
+            if (source.ShaderName.StartsWith("Custom/Props/Decal/", StringComparison.Ordinal) && !isGroundDecal)
+            {
+                throw new InvalidDataException(
+                    $"材质 {checksum} 使用地形投影贴花 Shader {source.ShaderName}；原始包围盒不能作为静态模型导出，需要单独的贴花投影转换");
+            }
             var color = source.Colors.TryGetValue("_Color", out var tint) ? tint : Vector4.One;
             var hasMainTexture = source.Textures.TryGetValue("_MainTex", out var mainChecksum) &&
                 !string.IsNullOrWhiteSpace(mainChecksum);
@@ -227,22 +243,46 @@ internal static class GltfBuilder
 
             var hasAciTexture = source.Textures.TryGetValue("_ACIMap", out var aciChecksum) &&
                 !string.IsNullOrWhiteSpace(aciChecksum);
+            var hasXycaTexture = source.Textures.TryGetValue("_XYCAMap", out var xycaChecksum) &&
+                !string.IsNullOrWhiteSpace(xycaChecksum);
             if (hasAciTexture && !SupportsInverseAciAlpha(source.ShaderName))
             {
                 throw new InvalidDataException(
                     $"材质 {checksum} 的 Shader 尚未校准 ACI 透明语义：{source.ShaderName}");
             }
 
-            if (hasAciTexture && !hasMainTexture)
+            if (hasXycaTexture && !string.Equals(source.ShaderName, "Custom/Trees/Default", StringComparison.Ordinal))
             {
-                throw new InvalidDataException($"材质 {checksum} 有 ACIMap，但没有 MainTex");
+                throw new InvalidDataException(
+                    $"材质 {checksum} 的 Shader 尚未校准 XYCA 透明语义：{source.ShaderName}");
+            }
+
+            if (hasAciTexture && hasXycaTexture)
+            {
+                throw new InvalidDataException($"材质 {checksum} 同时包含 ACIMap 和 XYCAMap，透明来源不明确");
+            }
+
+            if ((hasAciTexture || hasXycaTexture) && !hasMainTexture)
+            {
+                throw new InvalidDataException($"材质 {checksum} 有透明遮罩，但没有 MainTex");
             }
 
             if (hasMainTexture)
             {
                 var png = TextureConverter.CreateBaseColorPng(
                     package.Textures[mainChecksum!],
-                    hasAciTexture ? package.Textures[aciChecksum!] : null);
+                    hasAciTexture ? package.Textures[aciChecksum!] :
+                        hasXycaTexture ? package.Textures[xycaChecksum!] : null,
+                    hasXycaTexture ? CutoutTextureChannel.Alpha : CutoutTextureChannel.Red,
+                    source.ShaderName == "Custom/Trees/Default" ? treeColorCorrection : null,
+                    autoCorrectTreeColor: source.ShaderName == "Custom/Trees/Default" &&
+                        !preserveTreeColors && treeColorCorrection is null,
+                    out var automaticColor);
+                if (automaticColor is not null)
+                {
+                    reportTreeColor?.Invoke(FormattableString.Invariant(
+                        $"树木自动颜色适配：材质={checksum}，阴影指数={automaticColor.ShadowGamma:R}，饱和度={automaticColor.Saturation:R}，源通道峰值中位数={automaticColor.SourceMedianIntensity:R}，可见像素={automaticColor.VisibleTexels}"));
+                }
                 var imageIndex = AddImage(png, checksum + "_BaseColor");
                 var textureIndex = _textures.Count;
                 _textures.Add(new Dictionary<string, object?>
@@ -260,7 +300,11 @@ internal static class GltfBuilder
                 ["doubleSided"] = true,
                 ["pbrMetallicRoughness"] = pbr,
             };
-            if (hasAciTexture)
+            if (isGroundDecal)
+            {
+                material["alphaMode"] = "BLEND";
+            }
+            if (hasAciTexture || hasXycaTexture)
             {
                 material["alphaMode"] = "MASK";
                 material["alphaCutoff"] = 0.5f;
@@ -446,32 +490,51 @@ internal static class GltfBuilder
 
 internal static class TextureConverter
 {
-    public static byte[] CreateBaseColorPng(CrpTexture mainTexture, CrpTexture? aciTexture)
+    public static byte[] CreateBaseColorPng(
+        CrpTexture mainTexture,
+        CrpTexture? cutoutTexture,
+        CutoutTextureChannel cutoutChannel,
+        TreeColorCorrection? colorCorrection,
+        bool autoCorrectTreeColor,
+        out TreeMaterialColorConverter.Analysis? automaticColor)
     {
         using var diffuse = DecodeImage(mainTexture.ImageBytes);
-        using var aci = aciTexture is null ? null : DecodeImage(aciTexture.ImageBytes);
-        if (aci is not null && (aci.Width != diffuse.Width || aci.Height != diffuse.Height))
+        using var cutout = cutoutTexture is null ? null : DecodeImage(cutoutTexture.ImageBytes);
+        if (cutout is not null && (cutout.Width != diffuse.Width || cutout.Height != diffuse.Height))
         {
             throw new InvalidDataException(
-                $"MainTex 与 ACIMap 尺寸不一致：{diffuse.Width}x{diffuse.Height} / {aci.Width}x{aci.Height}");
+                $"MainTex 与透明遮罩尺寸不一致：{diffuse.Width}x{diffuse.Height} / {cutout.Width}x{cutout.Height}");
         }
 
-        if (aci is not null)
+        if (cutout is not null)
         {
-            diffuse.ProcessPixelRows(aci, static (diffuseRows, aciRows) =>
+            diffuse.ProcessPixelRows(cutout, (diffuseRows, cutoutRows) =>
             {
                 for (var y = 0; y < diffuseRows.Height; y++)
                 {
                     var diffuseRow = diffuseRows.GetRowSpan(y);
-                    var aciRow = aciRows.GetRowSpan(y);
+                    var cutoutRow = cutoutRows.GetRowSpan(y);
                     for (var x = 0; x < diffuseRow.Length; x++)
                     {
                         ref var pixel = ref diffuseRow[x];
-                        // C:S Building/Default treats ACI.R=0 as visible and 1 as cut out.
-                        pixel.A = Math.Min(pixel.A, (byte)(255 - aciRow[x].R));
+                        // The game's importer inverts building ACI.R and tree XYCA.A.
+                        var mask = cutoutChannel == CutoutTextureChannel.Alpha
+                            ? cutoutRow[x].A
+                            : cutoutRow[x].R;
+                        pixel.A = Math.Min(pixel.A, (byte)(255 - mask));
                     }
                 }
             });
+        }
+
+        automaticColor = autoCorrectTreeColor ? TreeMaterialColorConverter.Analyze(diffuse, mainTexture.ForceLinear) : null;
+        if (automaticColor is not null)
+        {
+            TreeMaterialColorConverter.ApplyAutomatic(diffuse, automaticColor, mainTexture.ForceLinear);
+        }
+        else if (colorCorrection is not null)
+        {
+            TreeMaterialColorConverter.Apply(diffuse, colorCorrection, mainTexture.ForceLinear);
         }
 
         using var output = new MemoryStream();
