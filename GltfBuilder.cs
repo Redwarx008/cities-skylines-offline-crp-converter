@@ -20,11 +20,14 @@ internal sealed record TreeColorCorrection(float ExposureStops, float Saturation
 internal static class GltfBuilder
 {
     public static byte[] Build(CrpPackage package, string assetName, TreeColorCorrection? treeColorCorrection = null,
-        bool preserveTreeColors = false, Action<string>? reportTreeColor = null)
-        => new Builder(package, treeColorCorrection, preserveTreeColors, reportTreeColor).Build(assetName);
+        bool preserveTreeColors = false, Action<string>? reportTreeColor = null,
+        IReadOnlyDictionary<string, TreeBaseColorOverride>? treeColorOverrides = null)
+        => new Builder(GeneratedBuildingBaseRemover.Apply(package, reportTreeColor),
+            treeColorCorrection, preserveTreeColors, reportTreeColor, treeColorOverrides).Build(assetName);
 
     private sealed class Builder(CrpPackage package, TreeColorCorrection? treeColorCorrection,
-        bool preserveTreeColors, Action<string>? reportTreeColor)
+        bool preserveTreeColors, Action<string>? reportTreeColor,
+        IReadOnlyDictionary<string, TreeBaseColorOverride>? treeColorOverrides)
     {
         private readonly BinaryBuffer _binary = new();
         private readonly List<Dictionary<string, object?>> _bufferViews = [];
@@ -36,6 +39,7 @@ internal static class GltfBuilder
         private readonly List<Dictionary<string, object?>> _nodes = [];
         private readonly Dictionary<string, int> _materialIndices = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, int> _meshIndices = new(StringComparer.OrdinalIgnoreCase);
+        private bool _usesSpecular;
 
         public byte[] Build(string assetName)
         {
@@ -79,6 +83,10 @@ internal static class GltfBuilder
                 },
             };
 
+            if (_usesSpecular)
+            {
+                document["extensionsUsed"] = new[] { "KHR_materials_specular" };
+            }
             var json = JsonSerializer.SerializeToUtf8Bytes(document, new JsonSerializerOptions
             {
                 DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
@@ -166,7 +174,7 @@ internal static class GltfBuilder
                 return existing;
             }
 
-            var mesh = package.Meshes[gameObject.MeshChecksum!];
+            var mesh = UnusedVertexCompactor.Apply(package.Meshes[gameObject.MeshChecksum!], gameObject.Name, reportTreeColor);
             var positionAccessor = AddVector3Accessor(
                 mesh.Positions.Select(static value => new Vector3(value.X, value.Y, -value.Z)).ToArray(),
                 includeBounds: true);
@@ -174,6 +182,12 @@ internal static class GltfBuilder
                 mesh.Normals.Select(static value => Vector3.Normalize(new Vector3(value.X, value.Y, -value.Z))).ToArray(),
                 includeBounds: false);
             var uvAccessor = AddVector2Accessor(mesh.TextureCoordinates);
+            int? tangentAccessor = null;
+            if (Enumerable.Range(0, mesh.SubMeshTriangles.Count).Any(slot =>
+                    mesh.SubMeshTriangles[slot].Length != 0 && UsesSurfaceMap(gameObject.MaterialChecksums[slot])))
+            {
+                tangentAccessor = AddVector4Accessor(TangentFrameConverter.Convert(mesh, gameObject.Name, reportTreeColor));
+            }
 
             var primitives = new List<Dictionary<string, object?>>(mesh.SubMeshTriangles.Count);
             for (var subMeshIndex = 0; subMeshIndex < mesh.SubMeshTriangles.Count; subMeshIndex++)
@@ -192,14 +206,19 @@ internal static class GltfBuilder
                     convertedIndices[triangle + 2] = (uint)sourceIndices[triangle + 1];
                 }
 
+                var attributes = new Dictionary<string, object?>
+                {
+                    ["POSITION"] = positionAccessor,
+                    ["NORMAL"] = normalAccessor,
+                    ["TEXCOORD_0"] = uvAccessor,
+                };
+                if (tangentAccessor is not null && UsesSurfaceMap(gameObject.MaterialChecksums[subMeshIndex]))
+                {
+                    attributes["TANGENT"] = tangentAccessor.Value;
+                }
                 primitives.Add(new Dictionary<string, object?>
                 {
-                    ["attributes"] = new Dictionary<string, object?>
-                    {
-                        ["POSITION"] = positionAccessor,
-                        ["NORMAL"] = normalAccessor,
-                        ["TEXCOORD_0"] = uvAccessor,
-                    },
+                    ["attributes"] = attributes,
                     ["indices"] = AddIndexAccessor(convertedIndices),
                     ["material"] = GetMaterialIndex(gameObject.MaterialChecksums[subMeshIndex]),
                     ["mode"] = 4,
@@ -245,6 +264,16 @@ internal static class GltfBuilder
                 !string.IsNullOrWhiteSpace(aciChecksum);
             var hasXycaTexture = source.Textures.TryGetValue("_XYCAMap", out var xycaChecksum) &&
                 !string.IsNullOrWhiteSpace(xycaChecksum);
+            var hasAprTexture = source.Textures.TryGetValue("_APRMap", out var aprChecksum) &&
+                !string.IsNullOrWhiteSpace(aprChecksum);
+            if (hasAprTexture)
+            {
+                if (source.ShaderName is not ("Custom/Net/RoadBridge" or "Custom/Net/Road"))
+                {
+                    throw new InvalidDataException($"材质 {checksum} 的 Shader 尚未校准 APR 地形/透明语义：{source.ShaderName}");
+                }
+                SurfaceTextureConverter.ValidateStaticBridgeMask(package.Textures[aprChecksum!], source.ShaderName == "Custom/Net/Road");
+            }
             if (hasAciTexture && !SupportsInverseAciAlpha(source.ShaderName))
             {
                 throw new InvalidDataException(
@@ -257,12 +286,12 @@ internal static class GltfBuilder
                     $"材质 {checksum} 的 Shader 尚未校准 XYCA 透明语义：{source.ShaderName}");
             }
 
-            if (hasAciTexture && hasXycaTexture)
+            if ((hasAciTexture ? 1 : 0) + (hasXycaTexture ? 1 : 0) + (hasAprTexture ? 1 : 0) > 1)
             {
-                throw new InvalidDataException($"材质 {checksum} 同时包含 ACIMap 和 XYCAMap，透明来源不明确");
+                throw new InvalidDataException($"材质 {checksum} 同时包含多个 ACI/XYCA/APR 遮罩，透明来源不明确");
             }
 
-            if ((hasAciTexture || hasXycaTexture) && !hasMainTexture)
+            if ((hasAciTexture || hasXycaTexture || hasAprTexture) && !hasMainTexture)
             {
                 throw new InvalidDataException($"材质 {checksum} 有透明遮罩，但没有 MainTex");
             }
@@ -272,12 +301,24 @@ internal static class GltfBuilder
                 var png = TextureConverter.CreateBaseColorPng(
                     package.Textures[mainChecksum!],
                     hasAciTexture ? package.Textures[aciChecksum!] :
-                        hasXycaTexture ? package.Textures[xycaChecksum!] : null,
+                        hasXycaTexture ? package.Textures[xycaChecksum!] :
+                        hasAprTexture ? package.Textures[aprChecksum!] : null,
                     hasXycaTexture ? CutoutTextureChannel.Alpha : CutoutTextureChannel.Red,
-                    source.ShaderName == "Custom/Trees/Default" ? treeColorCorrection : null,
+                    source.ShaderName == "Custom/Trees/Default" && treeColorOverrides is null ? treeColorCorrection : null,
                     autoCorrectTreeColor: source.ShaderName == "Custom/Trees/Default" &&
-                        !preserveTreeColors && treeColorCorrection is null,
+                        !preserveTreeColors && treeColorCorrection is null && treeColorOverrides is null,
                     out var automaticColor);
+                if (source.ShaderName == "Custom/Trees/Default" && treeColorOverrides is not null)
+                {
+                    if (!treeColorOverrides.TryGetValue(checksum, out var preserved))
+                    {
+                        throw new InvalidDataException($"复用树木颜色的 GLB 缺少源材质 {checksum}");
+                    }
+                    TreeBaseColorOverrideReader.ValidateAlpha(png, preserved.Png);
+                    png = preserved.Png;
+                    pbr["baseColorFactor"] = new[] { preserved.Factor.X, preserved.Factor.Y, preserved.Factor.Z, preserved.Factor.W };
+                    reportTreeColor?.Invoke($"保留既有树木颜色：{checksum}，RGB/alpha PNG 字节不变；另行补齐源法线");
+                }
                 if (automaticColor is not null)
                 {
                     reportTreeColor?.Invoke(FormattableString.Invariant(
@@ -300,11 +341,49 @@ internal static class GltfBuilder
                 ["doubleSided"] = true,
                 ["pbrMetallicRoughness"] = pbr,
             };
+            if (source.ShaderName == "Custom/Trees/Default" && hasXycaTexture)
+            {
+                var normalPng = SurfaceTextureConverter.CreateNormalPng(package.Textures[xycaChecksum!]);
+                var normalImage = AddImage(normalPng, checksum + "_TreeNormal");
+                var normalTexture = _textures.Count;
+                _textures.Add(new Dictionary<string, object?>
+                {
+                    ["name"] = checksum + "_TreeNormal", ["sampler"] = 0, ["source"] = normalImage,
+                });
+                material["normalTexture"] = new Dictionary<string, object?> { ["index"] = normalTexture };
+            }
+            if (source.Textures.TryGetValue("_XYSMap", out var xysChecksum) && !string.IsNullOrWhiteSpace(xysChecksum))
+            {
+                if (!SurfaceTextureConverter.SupportsShader(source.ShaderName))
+                {
+                    throw new InvalidDataException($"材质 {checksum} 的 Shader 尚未校准 XYS 法线/反光语义：{source.ShaderName}");
+                }
+                var png = SurfaceTextureConverter.CreateNormalSpecularPng(package.Textures[xysChecksum]);
+                var imageIndex = AddImage(png, checksum + "_NormalSpecular");
+                var textureIndex = _textures.Count;
+                _textures.Add(new Dictionary<string, object?>
+                {
+                    ["name"] = checksum + "_NormalSpecular", ["sampler"] = 0, ["source"] = imageIndex,
+                });
+                if (SurfaceTextureConverter.UsesNormalMap(source.ShaderName))
+                {
+                    material["normalTexture"] = new Dictionary<string, object?> { ["index"] = textureIndex };
+                }
+                material["extensions"] = new Dictionary<string, object?>
+                {
+                    ["KHR_materials_specular"] = new Dictionary<string, object?>
+                    {
+                        ["specularFactor"] = 1f,
+                        ["specularTexture"] = new Dictionary<string, object?> { ["index"] = textureIndex },
+                    },
+                };
+                _usesSpecular = true;
+            }
             if (isGroundDecal)
             {
                 material["alphaMode"] = "BLEND";
             }
-            if (hasAciTexture || hasXycaTexture)
+            if (hasAciTexture || hasXycaTexture || hasAprTexture)
             {
                 material["alphaMode"] = "MASK";
                 material["alphaCutoff"] = 0.5f;
@@ -319,6 +398,14 @@ internal static class GltfBuilder
         private static bool SupportsInverseAciAlpha(string shaderName)
             => shaderName.StartsWith("Custom/Buildings/Building/", StringComparison.Ordinal) ||
                 shaderName.StartsWith("Custom/Props/Prop/", StringComparison.Ordinal);
+
+        private bool UsesSurfaceMap(string checksum)
+        {
+            var material = package.Materials[checksum];
+            var role = material.ShaderName == "Custom/Trees/Default" ? "_XYCAMap" : "_XYSMap";
+            return SurfaceTextureConverter.UsesNormalMap(material.ShaderName) &&
+                material.Textures.TryGetValue(role, out var value) && !string.IsNullOrWhiteSpace(value);
+        }
 
         private int AddImage(byte[] png, string name)
         {
@@ -368,6 +455,25 @@ internal static class GltfBuilder
 
             var accessorIndex = _accessors.Count;
             _accessors.Add(accessor);
+            return accessorIndex;
+        }
+
+        private int AddVector4Accessor(Vector4[] values)
+        {
+            var bytes = new byte[values.Length * 16];
+            for (var index = 0; index < values.Length; index++)
+            {
+                WriteSingle(bytes.AsSpan(index * 16), values[index].X);
+                WriteSingle(bytes.AsSpan(index * 16 + 4), values[index].Y);
+                WriteSingle(bytes.AsSpan(index * 16 + 8), values[index].Z);
+                WriteSingle(bytes.AsSpan(index * 16 + 12), values[index].W);
+            }
+            var accessorIndex = _accessors.Count;
+            _accessors.Add(new Dictionary<string, object?>
+            {
+                ["bufferView"] = AddBufferView(bytes, 34962), ["componentType"] = 5126,
+                ["count"] = values.Length, ["type"] = "VEC4",
+            });
             return accessorIndex;
         }
 
@@ -546,7 +652,7 @@ internal static class TextureConverter
         return output.ToArray();
     }
 
-    private static Image<Rgba32> DecodeImage(byte[] bytes)
+    internal static Image<Rgba32> DecodeImage(byte[] bytes)
     {
         if (!bytes.AsSpan().StartsWith("DDS "u8))
         {

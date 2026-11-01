@@ -4,7 +4,7 @@ internal static class Program
 {
     private sealed record Arguments(string CrpPath, string OutputPath, string? AssetName, string? WorkshopDirectory,
         float? DecalGroundHeight, IReadOnlySet<string> ExcludedPrefabNames, TreeColorCorrection? TreeColorCorrection,
-        bool PreserveTreeColors);
+        bool PreserveTreeColors, string? ReuseTreeColors);
 
     public static int Main(string[] args)
     {
@@ -28,8 +28,10 @@ internal static class Program
                 ?? throw new ArgumentException($"输出路径没有父目录：{outputPath}");
             Directory.CreateDirectory(outputDirectory);
 
+            package = GeneratedBuildingBaseRemover.Apply(package, Console.WriteLine);
             var glb = GltfBuilder.Build(package, assetName, arguments.TreeColorCorrection,
-                arguments.PreserveTreeColors, Console.WriteLine);
+                arguments.PreserveTreeColors, Console.WriteLine,
+                arguments.ReuseTreeColors is null ? null : TreeBaseColorOverrideReader.Read(arguments.ReuseTreeColors));
             GlbValidator.Validate(glb, package, assetName);
             File.WriteAllBytes(outputPath, glb);
 
@@ -84,7 +86,7 @@ internal static class Program
             else
             {
                 if (!new[] { "--crp", "--output", "--name", "--workshop", "--decal-ground",
-                        "--tree-color-mode", "--tree-color-exposure", "--tree-color-saturation" }
+                        "--tree-color-mode", "--tree-color-exposure", "--tree-color-saturation", "--reuse-tree-colors" }
                     .Contains(option, StringComparer.OrdinalIgnoreCase))
                 {
                     throw new ArgumentException($"未知选项：{option}");
@@ -150,9 +152,22 @@ internal static class Program
             treeCorrection = new TreeColorCorrection(exposure, saturation);
         }
 
+        values.TryGetValue("--reuse-tree-colors", out var reuseTreeColors);
+        if (reuseTreeColors is not null)
+        {
+            if (!File.Exists(reuseTreeColors) || Path.GetExtension(reuseTreeColors).ToLowerInvariant() != ".glb")
+            {
+                throw new ArgumentException("--reuse-tree-colors 必须指向现有 GLB");
+            }
+            if (values.ContainsKey("--tree-color-mode") || treeCorrection is not null)
+            {
+                throw new ArgumentException("复用既有树木颜色不能与自动/原色/手动校色选项混用");
+            }
+            reuseTreeColors = Path.GetFullPath(reuseTreeColors);
+        }
         return new Arguments(crpPath, outputPath, string.IsNullOrWhiteSpace(assetName) ? null : assetName.Trim(),
             workshopDirectory is null ? null : Path.GetFullPath(workshopDirectory), decalGroundHeight, excludedPrefabNames,
-            treeCorrection, preserveTreeColors);
+            treeCorrection, preserveTreeColors, reuseTreeColors);
     }
 
     private static float ReadColorParameter(IReadOnlyDictionary<string, string> values, string key, float minimum, float maximum)

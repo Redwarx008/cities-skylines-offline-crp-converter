@@ -8,6 +8,7 @@ internal static class GlbValidator
 {
     public static void Validate(byte[] glb, CrpPackage package, string assetName)
     {
+        package = GeneratedBuildingBaseRemover.Apply(package);
         if (glb.Length < 28 || BinaryPrimitives.ReadUInt32LittleEndian(glb) != 0x46546C67 ||
             BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(4)) != 2 ||
             BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(8)) != glb.Length)
@@ -50,6 +51,39 @@ internal static class GlbValidator
             if (!material.GetProperty("doubleSided").GetBoolean())
             {
                 throw new InvalidDataException("GLB 存在未设置双面的材质");
+            }
+            var source = package.Materials[material.GetProperty("name").GetString()!];
+            if (source.ShaderName == "Custom/Trees/Default" && source.Textures.TryGetValue("_XYCAMap", out var xyca) &&
+                !string.IsNullOrWhiteSpace(xyca) && !material.TryGetProperty("normalTexture", out _))
+            {
+                throw new InvalidDataException("GLB 遗漏源树木 XYCAMap 的法线绑定");
+            }
+            if (source.Textures.TryGetValue("_XYSMap", out var xys) && !string.IsNullOrWhiteSpace(xys))
+            {
+                var hasNormal = material.TryGetProperty("normalTexture", out var normal);
+                if ((SurfaceTextureConverter.UsesNormalMap(source.ShaderName) && !hasNormal) ||
+                    !material.TryGetProperty("extensions", out var extensions) ||
+                    !extensions.TryGetProperty("KHR_materials_specular", out var specular) ||
+                    !specular.TryGetProperty("specularTexture", out var specularTexture) ||
+                    !root.TryGetProperty("extensionsUsed", out var used) ||
+                    !used.EnumerateArray().Any(static item => item.GetString() == "KHR_materials_specular"))
+                {
+                    throw new InvalidDataException("GLB 遗漏源 XYSMap 的法线或反光材质绑定");
+                }
+                foreach (var binding in hasNormal ? new[] { normal, specularTexture } : new[] { specularTexture })
+                {
+                    var textureIndex = binding.GetProperty("index").GetInt32();
+                    var textures = root.GetProperty("textures");
+                    if (textureIndex < 0 || textureIndex >= textures.GetArrayLength())
+                    {
+                        throw new InvalidDataException("GLB 法线/反光贴图索引越界");
+                    }
+                    var imageIndex = textures[textureIndex].GetProperty("source").GetInt32();
+                    if (imageIndex < 0 || imageIndex >= root.GetProperty("images").GetArrayLength())
+                    {
+                        throw new InvalidDataException("GLB 法线/反光图像索引越界");
+                    }
+                }
             }
         }
 

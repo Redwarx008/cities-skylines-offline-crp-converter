@@ -75,7 +75,7 @@ using var mask = new Image<Rgba32>(2, 1);
 mask[0, 0] = new Rgba32(0, 0, 0, 0);
 mask[1, 0] = new Rgba32(0, 0, 0, 255);
 var source = new CrpTexture(false, Png(diffuse));
-var cutout = new CrpTexture(false, Png(mask));
+var cutout = new CrpTexture(true, Png(mask));
 var png = TextureConverter.CreateBaseColorPng(source, cutout, CutoutTextureChannel.Alpha, null, true, out var stats);
 using (var merged = Image.Load<Rgba32>(png))
     Check(stats!.VisibleTexels == 1 && merged[0, 0].A == 255 && merged[1, 0].A == 0 && stats.ShadowGamma < 1,
@@ -125,3 +125,4 @@ using (var manualImage = Image.Load<Rgba32>(manual))
     Check(manualStats is null && manualImage[0, 0] == diffuse[0, 0] && manualImage[1, 0].A == 0,
         "Manual identity bypasses automatic policy");
 Console.WriteLine($"TREE_COLOR_REGRESSIONS={passed}");
+OfflineCrpConverter.Tests.SurfaceAndBaseRegression.Run();
